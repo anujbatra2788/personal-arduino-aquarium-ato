@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.yml": "yaml",
+        "mock_arduino.h": "c",
+        "iostream": "cpp"
+    }
+}
