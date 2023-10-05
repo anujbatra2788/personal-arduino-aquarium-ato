@@ -3,7 +3,7 @@
 										E S P		8 2 6 6
  *************************************************************************************************/
 const char 			WIFI_SSID[] 											= "Batras"; 
-const char 			WIFI_PASSWORD[] 										= "XXXX"; 
+const char 			WIFI_PASSWORD[] 										= "Exc3lsi0r"; 
 int 				WIFI_STATUS												= WL_IDLE_STATUS;
 boolean				INTERNET_AVAILABLE										= false;
 /*************************************************************************************************
