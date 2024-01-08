@@ -35,7 +35,8 @@ void loop() {
       initiateMQTTConnect();
     }
     mqttClient.loop();
-    mqttClient.publish("gf/lr/aquarium-manager/esp8266/loop", String(millis()).c_str(), false);
+    publishAvailableStatus();
+    
     String json = Serial.readString();
     if(json.length() > 0) {
       mqttClient.publish("gf/lr/aquarium-manager/message", json.c_str());
@@ -51,7 +52,8 @@ void loop() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(56700);
+  Serial.setTimeout(500);
 
   Serial.println("ESP8266::Commencing EEPROM");
   EEPROM.begin(EEPROM_SIZE);
@@ -67,9 +69,7 @@ void setup() {
   server.begin();
 
   if(strcmp(espConfig.SSID.c_str(), "") != 0 && strcmp(espConfig.wifiPassword.c_str(), "") != 0) {
-
     initiateWifiConnect(espConfig.SSID, espConfig.wifiPassword, false);
-
     Serial.print("ESP8266::setup::3::Setup Read Config mqttServer: ");
     Serial.print(espConfig.mqttServer);
     Serial.print(", and mqttPort: ");
@@ -187,7 +187,7 @@ void initiateMQTTConnect() {
     if (connected) {
       Serial.println("ESP8266::connected");
       mqttClient.subscribe("gf/lr/aquarium-manager/command/#");
-      mqttClient.publish("gf/lr/aquarium-manager/available", "ON", false);
+      publishAvailableStatus();
     } else {
       Serial.print("ESP8266::failed, rc=");
       Serial.print(mqttClient.state());
@@ -198,10 +198,17 @@ void initiateMQTTConnect() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("ESP8266::Message arrived on topic: '");
-  Serial.print(topic);
-  Serial.print("' with payload: ");
+  String logMessage = "ESP8266::Message arrived on topic: '";
+  logMessage += topic;
+  logMessage += "' with payload: ";
   
+  String payloadStr;
+  for (unsigned int i = 0; i < length; i++) {
+    payloadStr += (char)payload[i];
+    // Serial.print((char)payload[i]);
+  }
+  
+  logMessage += payloadStr;
   // String commandPayload = "{\"topic\": \"";
   // commandPayload += topic;
   // commandPayload += "\", \"commandPayload\":";
@@ -209,18 +216,18 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // commandPayload += "}";
 
   //Serial.print(commandPayload);
-  String payloadStr;
-  for (unsigned int i = 0; i < length; i++) {
-    payloadStr += (char)payload[i];
-    // Serial.print((char)payload[i]);
-  }
-  mqttClient.publish("gf/lr/aquarium-manager/command/received", payloadStr.c_str(), true);
+  mqttClient.publish("gf/lr/aquarium-manager/esp8266-arduino/log", logMessage.c_str(), true);
+  mqttClient.publish("gf/lr/aquarium-manager/command-received", payloadStr.c_str(), true);
   Serial.println(payloadStr.c_str());
   
 }
 
-void handleRoot() {
+void publishAvailableStatus() {
+  mqttClient.publish("gf/lr/aquarium-manager/available", "ON", false);
+  mqttClient.publish("gf/lr/aquarium-manager/esp8266/loop", String(millis()).c_str(), false);
+}
 
+void handleRoot() {
   int numNetworks = WiFi.scanNetworks();
   String html = "<html><head>";
   html += "</head><body>";
@@ -343,7 +350,7 @@ void espChipConfigInfo() {
   html += "</h3>";
 
   html += "<h3>MQTT Connected: ";
-  html += mqttClient.connected();
+  html += mqttClient.connected() ? "true": "false";
   html += "</h3>";
 
   html += "</body></html>";
