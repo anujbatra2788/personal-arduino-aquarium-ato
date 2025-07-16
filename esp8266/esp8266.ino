@@ -1,361 +1,219 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
 #include <EEPROM.h>
-#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <ESP8266WebServer.h>
+#include <SoftwareSerial.h>
 
-#define EEPROM_ADDRESS 0
-#define EEPROM_SIZE 512
+// SoftwareSerial for communication with Arduino
+SoftwareSerial espSerial(2, 3); // RX, TX
 
-const char *apSSID = "AquariumManager";
-const char *apPassword = "12345678";
-
+// ESP8266 Configuration Structure
 struct ESPConfig {
-  String SSID;
-  String wifiPassword;
-  String mqttServer;
+  char SSID[32];
+  char wifiPassword[32];
+  char mqttServer[32];
   int mqttPort;
-  String mqttUser;
-  String mqttPassword;
+  char mqttUser[32];
+  char mqttPassword[32];
 };
 
-
-DynamicJsonDocument espChipConfig(1024);
-ESPConfig espConfig;
-
+// Global variables
+ESPConfig config;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 ESP8266WebServer server(80);
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+const int EEPROM_SIZE = 512;
+const int CONFIG_ADDRESS = 0;
 
-int count = 0;
-void loop() {
-  server.handleClient();
-  if(WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) {
-      initiateMQTTConnect();
-    }
-    mqttClient.loop();
-    publishAvailableStatus();
-    
-    String json = Serial.readString();
-    if(json.length() > 0) {
-      mqttClient.publish("gf/lr/aquarium-manager/message", json.c_str());
-      delay(5000);
-      if(json.startsWith("{")) {
-        DynamicJsonDocument jsonRequest(512);
-        deserializeJson(jsonRequest, json);
-        publishMQTTMessage(jsonRequest);
-      }
-    }
-  }
-  delay(2000);
-}
+// HTML for configuration page
+const char* configPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Aquarium Manager Setup</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 20px; }
+    input { width: 100%; padding: 8px; margin: 10px 0; }
+    button { padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
+    button:hover { background: #0056b3; }
+  </style>
+</head>
+<body>
+  <h2>Aquarium Manager Configuration</h2>
+  <form action="/save" method="POST">
+    <label>WiFi SSID:</label><input type="text" name="ssid" required><br>
+    <label>WiFi Password:</label><input type="password" name="password" required><br>
+    <label>MQTT Server:</label><input type="text" name="mqttServer" required><br>
+    <label>MQTT Port:</label><input type="number" name="mqttPort" required><br>
+    <label>MQTT User:</label><input type="text" name="mqttUser"><br>
+    <label>MQTT Password:</label><input type="password" name="mqttPassword"><br>
+    <button type="submit">Save Configuration</button>
+  </form>
+</body>
+</html>
+)";
+
+// HTML for info page
+const char* infoPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Aquarium Manager Info</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 20px; }
+    .info { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h2>Aquarium Manager Info</h2>
+  <div class="info">SSID: %SSID%</div>
+  <div class="info">MQTT Server: %MQTT_SERVER%</div>
+  <div class="info">MQTT Port: %MQTT_PORT%</div>
+  <div class="info">MQTT User: %MQTT_USER%</div>
+  <a href="/reset">Reset Configuration</a>
+</body>
+</html>
+)";
 
 void setup() {
-  Serial.begin(56700);
-  Serial.setTimeout(500);
-
-  Serial.println("ESP8266::Commencing EEPROM");
+  Serial.begin(9600);
+  espSerial.begin(9600);
+  
+  // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
+  readConfig();
+
+  // Setup WiFi and MQTT
+  setupWiFi();
+  setupMQTT();
   
-  Serial.println("ESP8266::Trying to read JSON config from EEPROM");
-  readConfigFromEEPROM();
-
-  Serial.print("ESP8266::Setup Read Config SSID: ");
-  Serial.print(espConfig.SSID);
-  Serial.print(", with password: ");
-  Serial.println(espConfig.wifiPassword);
-
+  // Setup web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/info", HTTP_GET, handleInfo);
+  server.on("/reset", HTTP_GET, handleReset);
   server.begin();
-
-  if(strcmp(espConfig.SSID.c_str(), "") != 0 && strcmp(espConfig.wifiPassword.c_str(), "") != 0) {
-    initiateWifiConnect(espConfig.SSID, espConfig.wifiPassword, false);
-    Serial.print("ESP8266::setup::3::Setup Read Config mqttServer: ");
-    Serial.print(espConfig.mqttServer);
-    Serial.print(", and mqttPort: ");
-    Serial.println(espConfig.mqttPort);
-
-    if(strcmp(espConfig.mqttServer.c_str(), "") != 0) {
-      Serial.print("ESP8266:: Setting the server and port for mqtt");
-      mqttClient.setServer(espConfig.mqttServer.c_str(), espConfig.mqttPort);
-      mqttClient.setCallback(callback);
-      initiateMQTTConnect();
-    }
-    
-  } else {
-    // Start in AP mode
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(apSSID, apPassword);
-
-    // Serve HTML page for WiFi credentials
-    
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/reset", HTTP_GET, resetEEPROM);
-    server.on("/connect", HTTP_POST, handleConnect);
-    Serial.print("ESP8266::Access Point started. Connect to WiFi network: AquariumManager. IP Address is ");
-    Serial.println(WiFi.softAPIP());
-  }
 }
 
-void publishMQTTMessage(DynamicJsonDocument &request) {
-  String topic = request["topic"].as<String>();
-  JsonObject sensorPayload = request["sensorPayload"].as<JsonObject>();
-  String sensorPayloadAsStr;
-  serializeJsonPretty(sensorPayload, sensorPayloadAsStr);
-  mqttClient.publish(topic.c_str(), sensorPayloadAsStr.c_str());
-}
-
-void readConfigFromEEPROM() {
-  // Read data from EEPROM into a buffer
-  char eepromData[EEPROM_SIZE];
-  for (int i = 0; i < EEPROM_SIZE; ++i) {
-    eepromData[i] = EEPROM.read(EEPROM_ADDRESS + i);
+void loop() {
+  server.handleClient();
+  if (!mqttClient.connected()) {
+    connectMQTT();
   }
-  Serial.print("ESP8266::Parsing JSON from: ");
-  Serial.println(eepromData);
-  // Parse the JSON data from the buffer
-  deserializeJson(espChipConfig, eepromData);
+  mqttClient.loop();
   
-  espConfig.SSID = espChipConfig["SSID"].as<String>();
-  espConfig.wifiPassword = espChipConfig["PWD"].as<String>();
-  espConfig.mqttServer = espChipConfig["mqttServer"].as<String>();
-  espConfig.mqttPort = espChipConfig["mqttPort"].as<String>().toInt();
-  espConfig.mqttUser = espChipConfig["mqttUser"].as<String>();
-  espConfig.mqttPassword = espChipConfig["mqttPassword"].as<String>();
-}
-
-
-
-void initiateWifiConnect(String ssid, String password, boolean writeToEEPROM) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  Serial.println("ESP8266::Connecting to WiFi...");
-
-  int timeout = millis();
-
-  while (WiFi.status() != WL_CONNECTED && (millis() - timeout < 30000)) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if(WiFi.status() == WL_CONNECTED) {
-    if(writeToEEPROM) {
-      Serial.println("ESP8266::Writing Wifi SSID and PWD config to EEPROM");
-      addToConfig("SSID", ssid);
-      addToConfig("PWD", password);
-    }
-    
-    // Set up proxy server
-    server.on("/reset", HTTP_GET, resetEEPROM);
-    server.on("/info", HTTP_GET, espChipConfigInfo);
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/connect", HTTP_POST, handleConnect);
-    server.on("/send-to-arduino", HTTP_GET, sendMessageToArduino);
-
-    Serial.print("ESP8266::\nConnected to WiFi!. Local IP is ");
-    Serial.println(WiFi.localIP());
-    server.send(200, "text/html", "WiFi connection successful. Reset is ready at /reset");
+  // Relay data from Arduino to MQTT
+  if (espSerial.available()) {
+    String data = espSerial.readStringUntil('\n');
+    mqttClient.publish("aquarium/data", data.c_str());
   }
 }
 
-void sendMessageToArduino() {
-  String message = server.arg("m");
-  Serial.print(message);
-}
-
-void initiateMQTTConnect() {
-  while (!mqttClient.connected()) {
-    Serial.print("ESP8266::Attempting MQTT connection...");
-    String mqttClientId = "AquariumManager-" + String(millis());
-    boolean connected;
-    if(strcmp(espConfig.mqttUser.c_str(), "") != 0 && strcmp(espConfig.mqttPassword.c_str(), "") != 0) {
-      Serial.print("ESP8266::Connecting MQTT with Client ID - ");
-      Serial.print(mqttClientId);
-      Serial.print(", user - ");
-      Serial.print(espConfig.mqttUser);
-      Serial.print(", and password - ");
-      Serial.println(espConfig.mqttPassword);
-      connected = mqttClient.connect(mqttClientId.c_str(), espConfig.mqttUser.c_str(), espConfig.mqttPassword.c_str());
-    } else {
-      Serial.print("ESP8266::Connecting MQTT with Client ID - ");
-      Serial.print(mqttClientId);
-      Serial.println(" anonymously.");
-      connected = mqttClient.connect(mqttClientId.c_str());
-    }
-     
-    if (connected) {
-      Serial.println("ESP8266::connected");
-      mqttClient.subscribe("gf/lr/aquarium-manager/command/#");
-      publishAvailableStatus();
-    } else {
-      Serial.print("ESP8266::failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println("will try again in 5 seconds");
-      delay(5000);
-    }
-  }
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  String logMessage = "ESP8266::Message arrived on topic: '";
-  logMessage += topic;
-  logMessage += "' with payload: ";
-  
-  String payloadStr;
+// MQTT callback
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message;
   for (unsigned int i = 0; i < length; i++) {
-    payloadStr += (char)payload[i];
-    // Serial.print((char)payload[i]);
+    message += (char)payload[i];
   }
   
-  logMessage += payloadStr;
-  // String commandPayload = "{\"topic\": \"";
-  // commandPayload += topic;
-  // commandPayload += "\", \"commandPayload\":";
-  // commandPayload += payload;
-  // commandPayload += "}";
+  // Send to Arduino
+  espSerial.println(message);
+}
 
-  //Serial.print(commandPayload);
-  mqttClient.publish("gf/lr/aquarium-manager/esp8266-arduino/log", logMessage.c_str(), true);
-  mqttClient.publish("gf/lr/aquarium-manager/command-received", payloadStr.c_str(), true);
-  Serial.println(payloadStr.c_str());
+void setupWiFi() {
+  if (strlen(config.SSID) > 0) {
+    WiFi.begin(config.SSID, config.wifiPassword);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+    }
+  }
   
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("AquariumManager", "12345678");
+  }
+}
+
+void setupMQTT() {
+  if (strlen(config.mqttServer) > 0) {
+    mqttClient.setServer(config.mqttServer, config.mqttPort);
+    mqttClient.setCallback(mqttCallback);
+    connectMQTT();
+  }
+}
+
+void connectMQTT() {
+  if (strlen(config.mqttPassword) > 0) {
+    Serial.println("Connecting to MQTT with authentication");
+    if (mqttClient.connect("AquariumClient", config.mqttUser, config.mqttPassword)) {
+      Serial.println("Connected with authentication");
+      mqttClient.subscribe("gf/lr/aquarium-manager/command/#");
+    } else {
+      Serial.println("Failed to connect with authentication");
+    }
+  } else {
+    Serial.println("Connecting to MQTT without authentication");
+    if (mqttClient.connect("AquariumClient")) {
+      Serial.println("Connected without authentication");
+      mqttClient.subscribe("gf/lr/aquarium-manager/command/#");
+    } else {
+      Serial.println("Failed to connect without authentication");
+    }
+  }
+  publishAvailableStatus();
 }
 
 void publishAvailableStatus() {
   mqttClient.publish("gf/lr/aquarium-manager/available", "ON", false);
-  mqttClient.publish("gf/lr/aquarium-manager/esp8266/loop", String(millis()).c_str(), false);
+}
+
+void readConfig() {
+  EEPROM.get(CONFIG_ADDRESS, config);
+}
+
+void writeConfig() {
+  EEPROM.put(CONFIG_ADDRESS, config);
+  EEPROM.commit();
+}
+
+void clearConfig() {
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  ESP.restart();
 }
 
 void handleRoot() {
-  int numNetworks = WiFi.scanNetworks();
-  String html = "<html><head>";
-  html += "</head><body>";
-  html += "<h1>WiFi Configuration</h1>";
-  html += "<form action='/connect' method='post'>";
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='ssid' class='form-label'>Select Wifi to Connect</label>";
-  html += "   <select name='ssid' class='form-select'>";
-
-  for (int i = 0; i < numNetworks; ++i) {
-    html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + "</option>";
-  }
-  html += "    </select>";
-  html += " </div>";
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='password' class='form-label'>Password</label>";
-  html += "   <input type='password' name='password' class='form-control' placeholder='Wifi Password'>";
-  html += " </div>";
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='mqttServer' class='form-label'>MQTT Server IP / Hostname</label>";
-  html += "   <input type='text' name='mqttServer' class='form-control' placeholder='MQTT Server IP / Hostname'>";
-  html += " </div>";
-
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='mqttPort' class='form-label'>MQTT Server Port</label>";
-  html += "   <input type='text' name='mqttPort' class='form-control' placeholder='MQTT Server Port'>";
-  html += " </div>";
-
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='mqttUser' class='form-label'>MQTT Username (can be blank)</label>";
-  html += "   <input type='text' name='mqttUser' class='form-control' placeholder='MQTT Username (can be blank)'>";
-  html += " </div>";
-
-  html += " <div class='form-floating mb-3'>";
-  html += "   <label for='mqttPassword' class='form-label'>MQTT Password (can be blank)</label>";
-  html += "   <input type='password' name='mqttPassword' class='form-control' placeholder='MQTT Password (can be blank)'>";
-  html += " </div>";
-  html += " <div class='col-12'>";
-  html += "   <button class='btn btn-primary' type='submit'>Connect Me!!!</button>";
-  html += " </div>";
-  html += "</form></body></html>";
-
-  server.send(200, "text/html", html);
+  server.send(200, "text/html", configPage);
 }
 
-void handleConnect() {
-  String ssid = server.arg("ssid");
-  String password = server.arg("password");
-
-  String mqttServer = server.arg("mqttServer");
-  String mqttPort = server.arg("mqttPort");
-  String mqttUser = server.arg("mqttUser");
-  String mqttPassword = server.arg("mqttPassword");
-  espChipConfig.clear();
-  initiateWifiConnect(ssid, password, true);
-
-  if(WiFi.status() == WL_CONNECTED) {
-    addToConfig("mqttServer", mqttServer);
-    addToConfig("mqttPort", mqttPort);
-    addToConfig("mqttUser", mqttUser);
-    addToConfig("mqttPassword", mqttPassword);
-  }
+void handleSave() {
+  strncpy(config.SSID, server.arg("ssid").c_str(), sizeof(config.SSID));
+  strncpy(config.wifiPassword, server.arg("password").c_str(), sizeof(config.wifiPassword));
+  strncpy(config.mqttServer, server.arg("mqttServer").c_str(), sizeof(config.mqttServer));
+  config.mqttPort = server.arg("mqttPort").toInt();
+  strncpy(config.mqttUser, server.arg("mqttUser").c_str(), sizeof(config.mqttUser));
+  strncpy(config.mqttPassword, server.arg("mqttPassword").c_str(), sizeof(config.mqttPassword));
   
-  server.send(200, "text/html", "WiFi connection successful. Please access ESP endpoints /reset and /info at " + WiFi.localIP().toString());
+  writeConfig();
+  server.send(200, "text/plain", "Configuration saved. Rebooting...");
+  ESP.restart();
 }
 
-
-void addToConfig(String key, String value) {
-  espChipConfig[key] = value;
-  String jsonString;
-  serializeJson(espChipConfig, jsonString);
-
-  // Write the serialized JSON data to EEPROM
-  for (int i = 0; i < jsonString.length(); ++i) {
-    EEPROM.write(EEPROM_ADDRESS + i, jsonString[i]);
-  }
-  Serial.print("ESP8266::Wrting EEPROM config - ");
-  Serial.println(jsonString);
-  // Commit the changes to EEPROM
-  EEPROM.commit();
+void handleInfo() {
+  String page = infoPage;
+  page.replace("%SSID%", config.SSID);
+  page.replace("%MQTT_SERVER%", config.mqttServer);
+  page.replace("%MQTT_PORT%", String(config.mqttPort));
+  page.replace("%MQTT_USER%", config.mqttUser);
+  server.send(200, "text/html", page);
 }
 
-void resetEEPROM() {
-  for (int i = 0; i < EEPROM_SIZE; ++i) {
-    EEPROM.write(i, 0xFF);
-  }
-
-  // Commit the changes to EEPROM
-  EEPROM.commit();
-  server.send(200, "text/html", "Reset Successfull!!!");
+void handleReset() {
+  clearConfig();
 }
-
-void espChipConfigInfo() {
-  String html = "<html><head>";
-  html += "</head><body>";
-  html += "<h1>ESP Chip Configuration</h1>";
-  
-  html += "<h3>SSID: ";
-  html += espConfig.SSID;
-  html += "</h3>";
-  
-  html += "<h3>Wifi Password: ";
-  html += espConfig.wifiPassword;
-  html += "</h3>";
-  
-  html += "<h3>MQTT Server: ";
-  html += espConfig.mqttServer;
-  html += "</h3>";
-  
-  html += "<h3>MQTT Port: ";
-  html += String(espConfig.mqttPort);
-  html += "</h3>";
-
-  html += "<h3>MQTT User: ";
-  html += espConfig.mqttUser;
-  html += "</h3>";
-
-  html += "<h3>MQTT Password: ";
-  html += espConfig.mqttPassword;
-  html += "</h3>";
-
-  html += "<h3>MQTT Connected: ";
-  html += mqttClient.connected() ? "true": "false";
-  html += "</h3>";
-
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
-
-
-
