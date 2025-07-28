@@ -2,39 +2,57 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <SoftwareSerial.h>
+#include <Adafruit_NeoPixel.h>
 
-// SoftwareSerial for communication with ESP8266
-SoftwareSerial espSerial(2, 3); // RX, TX
-
-// Pin definitions
+// -- Pin Definitions --
+// Water Level Sensors
 const int PIN_ATO_LEVEL_SENSOR_SUMP_HIGHER_THRESHOLD = 12;
 const int PIN_ATO_LEVEL_SENSOR_SUMP_LOWER_THRESHOLD = 13;
 const int PIN_ATO_LEVEL_SENSOR_RESERVOIR_HIGHER_THRESHOLD = 10;
 const int PIN_ATO_LEVEL_SENSOR_RESERVOIR_LOWER_THRESHOLD = 11;
+// Relay Pins
 const int PIN_ATO_RELAY_RESERVOIR_TO_SUMP = 9;
 const int PIN_ATO_RELAY_RO_TO_RESERVOIR = 8;
+// Temperature Sensor
 const int DS18B20_TEMP_SENSOR_BUS = 19;
+// WS2812B RGB LED Ring
+const int PIN_NEOPIXEL = 6;
+const int NUMPIXELS = 16; // Number of LEDs in your ring
 
+// -- MQTT Topics --
 const char* MQTT_TOPIC_ATO_SWITCH_RO_TO_RESERVOIR = "ground-floor/living-room/aquarium/ato/switch/reservoir-fill";
 const char* MQTT_TOPIC_ATO_SWITCH_RESERVOIR_TO_SUMP = "ground-floor/living-room/aquarium/ato/switch/sump-fill";
 const char* MQTT_TOPIC_PUBLISH_SUMP_WATER_TEMPERATURE = "ground-floor/living-room/aquarium/sump/temperature";
 const char* MQTT_TOPIC_ERROR = "aquarium/error";
 
-boolean ATO_PROCESS_RUNNING = false;
+// -- Global Variables & Objects --
+// Serial for ESP8266 communication
+SoftwareSerial espSerial(2, 3); // RX, TX
+// Temperature Sensor Objects
 OneWire oneWire(DS18B20_TEMP_SENSOR_BUS);
 DallasTemperature sensors(&oneWire);
+// NeoPixel LED Ring Object
+Adafruit_NeoPixel pixels(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
+// State Machine
 enum State { IDLE, FILLING_RESERVOIR, FILLING_SUMP };
 State currentState = IDLE;
+boolean ATO_PROCESS_RUNNING = false;
+boolean ledsAreOn = false; // To prevent unnecessary LED updates
+
+// Timers
 unsigned long lastTempReport = 0;
 const unsigned long TEMP_INTERVAL = 300000; // 5 minutes
 unsigned long pumpStartTime = 0;
 const unsigned long PUMP_TIMEOUT = 300000; // 5 minutes
 
+// -- Core Functions --
 void setup() {
   Serial.begin(57600);
   espSerial.begin(9600);
   Serial.setTimeout(500);
+
+  // Initialize Pins
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(PIN_ATO_LEVEL_SENSOR_SUMP_HIGHER_THRESHOLD, INPUT);
   pinMode(PIN_ATO_LEVEL_SENSOR_SUMP_LOWER_THRESHOLD, INPUT);
@@ -42,13 +60,21 @@ void setup() {
   pinMode(PIN_ATO_LEVEL_SENSOR_RESERVOIR_LOWER_THRESHOLD, INPUT);
   pinMode(PIN_ATO_RELAY_RESERVOIR_TO_SUMP, OUTPUT);
   pinMode(PIN_ATO_RELAY_RO_TO_RESERVOIR, OUTPUT);
+
+  // Set initial relay state to OFF (assuming active-low relays)
   digitalWrite(PIN_ATO_RELAY_RO_TO_RESERVOIR, HIGH);
   digitalWrite(PIN_ATO_RELAY_RESERVOIR_TO_SUMP, HIGH);
+
+  // Initialize LED Ring
+  pixels.begin();
+  pixels.clear();
+  pixels.show();
 }
 
 void loop() {
   checkAndExecuteAnyRemoteCommand();
   reportTemperature();
+  handleLedStatus();
 
   // Check sensor validity
   bool sumpSensorsValid = isSensorValid(PIN_ATO_LEVEL_SENSOR_SUMP_LOWER_THRESHOLD, PIN_ATO_LEVEL_SENSOR_SUMP_HIGHER_THRESHOLD);
@@ -74,6 +100,7 @@ void loop() {
     currentState = IDLE;
   }
 
+  // Main state machine
   switch (currentState) {
     case IDLE:
       if (!reservoirHaveWater()) {
@@ -102,6 +129,44 @@ void loop() {
       break;
   }
 }
+
+// -- LED Control Functions --
+
+void handleLedStatus() {
+  if (!reservoirHaveWater()) {
+    reservoirEmptyAnimation();
+    ledsAreOn = true;
+  } else if (currentState == FILLING_RESERVOIR) {
+    pixels.fill(pixels.Color(0, 0, 255)); // Solid blue for filling
+    pixels.show();
+    ledsAreOn = true;
+  } else {
+    if (ledsAreOn) { // Turn off LEDs if they were on
+      pixels.clear();
+      pixels.show();
+      ledsAreOn = false;
+    }
+  }
+}
+
+void reservoirEmptyAnimation() {
+  static unsigned long lastUpdate = 0;
+  static int currentPixel = 0;
+  unsigned long now = millis();
+
+  if (now - lastUpdate > 100) { // Animation speed
+    lastUpdate = now;
+    pixels.clear();
+    pixels.setPixelColor(currentPixel, pixels.Color(255, 0, 0)); // Red
+    pixels.show();
+    currentPixel++;
+    if (currentPixel >= NUMPIXELS) {
+      currentPixel = 0;
+    }
+  }
+}
+
+// -- Communication & Sensor Functions --
 
 void checkAndExecuteAnyRemoteCommand() {
   if (espSerial.available()) {
@@ -180,17 +245,17 @@ void changePumpState(const char* topic, int digitalRelayPin, int startOrStop) {
 }
 
 void publishSensorData(char* topic, char* sensor, char* sensorValue) {
-  String payload = "{\"topic\": \"";
+  String payload = "{"topic": "";
   payload += topic;
-  payload += "\", \"sensorPayload\": { \"";
+  payload += "", "sensorPayload": { "";
   payload += sensor;
-  payload += "\": \"";
+  payload += "": "";
   payload += sensorValue;
-  payload += "\"}}";
+  payload += ""}}";
   espSerial.println(payload);
 }
 
 void publishError(const char* message) {
-  String payload = "{\"topic\": \"aquarium/error\", \"sensorPayload\": {\"error\": \"" + String(message) + "\"}}";
+  String payload = "{"topic": "aquarium/error", "sensorPayload": {"error": "" + String(message) + ""}}";
   espSerial.println(payload);
 }
